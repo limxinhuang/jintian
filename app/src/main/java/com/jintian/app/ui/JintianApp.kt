@@ -52,6 +52,7 @@ import java.util.UUID
 import kotlin.math.abs
 
 typealias EditState = ((AppState) -> AppState, () -> Unit) -> Unit
+typealias EditStateFail = ((AppState) -> AppState, () -> Unit, () -> Unit) -> Unit
 
 @Composable
 fun JintianApp(viewModel: MainViewModel) {
@@ -67,11 +68,11 @@ fun JintianApp(viewModel: MainViewModel) {
                 else { Text(loadError!!); Spacer(Modifier.height(16.dp)); Button(onClick = viewModel::load) { Text("重试") } }
             }
         }
-    } else JintianContent(state!!, busy, { change, done -> viewModel.edit(change, done) }, snackbar,backupContent={BackupRoute(viewModel)})
+    } else JintianContent(state!!, busy, { change, done -> viewModel.edit(change, done) }, snackbar, backupContent={BackupRoute(viewModel)}, onEditWithFail = { change, done, fail -> viewModel.edit(change, done, fail) })
 }
 
 @Composable
-fun JintianContent(state: AppState, busy: Boolean, onEdit: EditState, snackbar: SnackbarHostState = remember { SnackbarHostState() }, backupContent: (@Composable () -> Unit)? = null) {
+fun JintianContent(state: AppState, busy: Boolean, onEdit: EditState, snackbar: SnackbarHostState = remember { SnackbarHostState() }, backupContent: (@Composable () -> Unit)? = null, onEditWithFail: EditStateFail? = null) {
     var route by rememberSaveable { mutableStateOf("home") }
     var goalId by rememberSaveable { mutableStateOf("") }
     var taskId by rememberSaveable { mutableStateOf("") }
@@ -87,19 +88,29 @@ fun JintianContent(state: AppState, busy: Boolean, onEdit: EditState, snackbar: 
     fun detail(id: String) { if(route != "detail" && route != "task") detailParent=route; goalId = id; route = "detail" }
     fun back() {
         if (busy) return
-        route = when(route) { "task" -> "detail"; "detail" -> detailParent; "archives" -> tab; "backup" -> "stats"; "stats" -> "home"; else -> "home" }
+        route = when(route) { "task", "group" -> "detail"; "detail" -> detailParent; "archives" -> tab; "backup" -> "stats"; "stats" -> "home"; else -> "home" }
         if(route == "home") tab="home"
     }
     fun editTask(id: String = "") { taskId = id; route = "task" }
-    fun change(block: (AppState) -> AppState, message: String? = null) {
-        onEdit(block) { if(message != null) scope.launch { snackbar.showSnackbar(message) } }
+    fun change(block: (AppState) -> AppState, message: String? = null, onError: () -> Unit = {}) {
+        if (onEditWithFail != null) {
+            onEditWithFail(block, { if(message != null) scope.launch { snackbar.showSnackbar(message) } }, onError)
+        } else {
+            try {
+                onEdit(block) { if(message != null) scope.launch { snackbar.showSnackbar(message) } }
+            } catch (e: Throwable) {
+                onError()
+                throw e
+            }
+        }
     }
     fun complete(id: String) {
-        if(state.active?.takeIf { it.task.id == id }?.task?.isQuantified == true) quantityTaskId = id
+        val active = state.active?.takeIf { it.task.id == id }
+        if(active != null && (active.task.isQuantified || GoalRules.requiresGroupAmount(active.task, state.goal(active.goalId)))) quantityTaskId = id
         else change({ GoalRules.complete(it, id) }, "已完成，可以选择下一件事。")
     }
-    val quantityTask = state.active?.takeIf { it.task.id == quantityTaskId && it.task.isQuantified }
-    if(quantityTask != null) QuantityCompletionDialog(quantityTask.task, state.goal(quantityTask.goalId), busy,
+    val quantityTask = state.active?.takeIf { active -> active.task.id == quantityTaskId && (active.task.isQuantified || GoalRules.requiresGroupAmount(active.task, state.goal(active.goalId))) }
+    if(quantityTask != null) QuantityCompletionDialog(quantityTask.task, state.goal(quantityTask.goalId), busy, group = GoalRules.groupFor(quantityTask.task, state.goal(quantityTask.goalId)),
         onDismiss = { quantityTaskId = null },
         onConfirm = { amount ->
             onEdit({ GoalRules.complete(it, quantityTask.task.id, amount = amount) }) {
@@ -107,11 +118,11 @@ fun JintianContent(state: AppState, busy: Boolean, onEdit: EditState, snackbar: 
                 scope.launch { snackbar.showSnackbar("本次完成量已记录。") }
             }
         })
-    val ending = state.active?.takeIf { it.task.id == endingTaskId && it.task.isRecurring }
+    val ending = state.active?.takeIf { it.task.id == endingTaskId && (it.task.isRecurring || GoalRules.canEndGroup(it.task, state.goal(it.goalId))) }
     if(ending != null) AlertDialog(
         onDismissRequest = { if(!busy) endingTaskId = null },
-        title = { Text("完成本次并结束循环？") },
-        text = { Text("本次会计入完成次数。这个循环自动生成的待执行和下一项将被移除，已有完成记录会保留。") },
+        title = { Text(if(ending.task.isGrouped) "完成本轮并结束整组循环？" else "完成本次并结束循环？") },
+        text = { Text("本次会计入完成记录。预生成的未来${if(ending.task.isGrouped) "整轮" else "步骤"}将被移除，已有历史会保留。") },
         confirmButton = { TextButton(onClick = {
             onEdit({ GoalRules.completeAndEndRecurrence(it, ending.task.id) }) {
                 endingTaskId = null
@@ -121,7 +132,7 @@ fun JintianContent(state: AppState, busy: Boolean, onEdit: EditState, snackbar: 
         dismissButton = { TextButton(onClick = { endingTaskId = null }, enabled = !busy) { Text("取消") } },
     )
     BackHandler(route != "home") { back() }
-    val heading = when(route) { "new-goal" -> "创建目标"; "task" -> if(taskId.isEmpty()) "拆出一个小步骤" else "编辑步骤"; "detail" -> selected?.title ?: "目标详情"; "archives" -> "已归档目标"; "stats" -> "统计"; "backup" -> "数据备份"; else -> "今天" }
+    val heading = when(route) { "new-goal" -> "创建目标"; "task" -> if(taskId.isEmpty()) "拆出一个小步骤" else "编辑步骤"; "group" -> "关联步骤"; "detail" -> selected?.title ?: "目标详情"; "archives" -> "已归档目标"; "stats" -> "统计"; "backup" -> "数据备份"; else -> "今天" }
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         snackbarHost = { SnackbarHost(snackbar) },
@@ -158,14 +169,18 @@ fun JintianContent(state: AppState, busy: Boolean, onEdit: EditState, snackbar: 
                             onEdit({ if(t == null) GoalRules.addTask(it,selected.id,Task(title=title,seriesId=if(recurring) UUID.randomUUID().toString() else null,targetAmount=amount,unit=unit)) else GoalRules.editTask(it,selected.id,t.id,title) }) { route = "detail" }
                         },onCancel = { route = "detail" })
                     }
+                    "group" -> if(selected != null) GroupForm(selected,busy,existing=selected.groups.find { it.id == taskId },onSave = { ids,name,mode,amount,unit ->
+                        onEdit({ if(selected.groups.any { group -> group.id == taskId }) GoalRules.editGroup(it,selected.id,taskId,ids,name,mode,amount,unit) else GoalRules.createGroup(it,selected.id,ids,name,mode,amount,unit) }) { route = "detail"; scope.launch { snackbar.showSnackbar("关联组已保存。") } }
+                    },onCancel = { route = "detail" })
                     "detail" -> if(selected != null) GoalDetail(state,selected,day.date,now,busy,
                         onEndRecurrence = { endingTaskId = it },
                         onStart = { selected.next?.id?.let { id -> change({ GoalRules.start(it,selected.id,id,System.currentTimeMillis()) }) } },
                         onComplete = ::complete,
                         onLock = { change({ GoalRules.lockNext(it,selected.id) },"下一项已锁定。") },
-                        onAdd = { editTask() }, onEditTask = { editTask(it) },
+                        onAdd = { editTask() }, onGroup = { taskId=""; route = "group" }, onEditGroup = { taskId=it; route="group" }, onEditTask = { editTask(it) },
                         onDelete = { id -> change({ GoalRules.deleteTask(it,selected.id,id) }) },
-                        onMove = { id, index -> change({ GoalRules.moveTask(it,selected.id,id,index) }) },
+                        onUnlink = { id -> change({ GoalRules.unlinkGroup(it,selected.id,id) },"关联已解除，步骤内容和顺序已保留。") },
+                        onMove = { id, index, onFail -> change({ GoalRules.moveTask(it,selected.id,id,index) }, onError = onFail) },
                         onArchive = { onEdit({ GoalRules.archive(it,selected.id) }) { home(); scope.launch { snackbar.showSnackbar("目标已完成并归档。") } } },
                         onDeleteEmpty = { onEdit({ GoalRules.deleteEmptyGoal(it,selected.id) }) { home() } })
                     "archives" -> ArchiveList(state.goals.filter { it.archived },::detail)
@@ -218,8 +233,10 @@ private fun ActiveCard(state: AppState, now: Instant, busy: Boolean, onGoal: (St
                 Text(TaskTime.clockText(seconds),Modifier.testTag("active-elapsed"),style=MaterialTheme.typography.headlineSmall,fontFamily=androidx.compose.ui.text.font.FontFamily.Monospace)
             }
             if(seconds >= 86400) Text("这个步骤已超过一天，请尽快完成。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.error)
-            Button(onClick = { onComplete(active.task.id) }, Modifier.fillMaxWidth().testTag("complete-task"), enabled = !busy) { Icon(Icons.Outlined.Check,null,Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text(if(active.task.isRecurring) "完成本次" else "完成这一步") }
-            if(active.task.isRecurring && !active.task.isQuantified) TextButton(onClick = { onEndRecurrence(active.task.id) }, Modifier.fillMaxWidth().testTag("end-recurrence"), enabled = !busy) { Text("完成并结束循环") }
+            val goal = state.goal(active.goalId)
+            val finalGroupStep = GoalRules.isGroupFinal(active.task, goal)
+            Button(onClick = { onComplete(active.task.id) }, Modifier.fillMaxWidth().testTag("complete-task"), enabled = !busy) { Icon(Icons.Outlined.Check,null,Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text(if(finalGroupStep) "完成本轮" else if(active.task.isRecurring) "完成本次" else "完成这一步") }
+            if((active.task.isRecurring && !active.task.isQuantified) || GoalRules.canEndGroup(active.task, goal)) TextButton(onClick = { onEndRecurrence(active.task.id) }, Modifier.fillMaxWidth().testTag("end-recurrence"), enabled = !busy) { Text(if(active.task.isGrouped) "完成本轮并结束整组循环" else "完成并结束循环") }
         }
     }
 }
@@ -276,7 +293,7 @@ private fun HomeScreen(state: AppState, day: DayProgress, now: Instant, busy: Bo
 }
 
 @Composable
-private fun GoalDetail(state: AppState, goal: Goal, today: LocalDate, now: Instant, busy: Boolean, onStart: () -> Unit, onComplete: (String) -> Unit, onLock: () -> Unit, onAdd: () -> Unit, onEditTask: (String) -> Unit, onDelete: (String) -> Unit, onMove: (String,Int) -> Unit, onArchive: () -> Unit, onDeleteEmpty: () -> Unit, onEndRecurrence: (String) -> Unit) {
+private fun GoalDetail(state: AppState, goal: Goal, today: LocalDate, now: Instant, busy: Boolean, onStart: () -> Unit, onComplete: (String) -> Unit, onLock: () -> Unit, onAdd: () -> Unit, onGroup: () -> Unit, onEditGroup: (String) -> Unit, onEditTask: (String) -> Unit, onDelete: (String) -> Unit, onUnlink: (String) -> Unit, onMove: (String,Int,() -> Unit) -> Unit, onArchive: () -> Unit, onDeleteEmpty: () -> Unit, onEndRecurrence: (String) -> Unit) {
     var showDone by rememberSaveable { mutableStateOf(goal.archived) }
     var deleteId by rememberSaveable { mutableStateOf<String?>(null) }
     var deleteEmpty by rememberSaveable { mutableStateOf(false) }
@@ -298,7 +315,8 @@ private fun GoalDetail(state: AppState, goal: Goal, today: LocalDate, now: Insta
                     else {
                         Text("下一个",style=MaterialTheme.typography.labelLarge,color=MaterialTheme.colorScheme.onSurfaceVariant)
                         Text(if(goal.pending.isEmpty()) "暂无下一项" else "排好顺序后，确认第一项。",style=MaterialTheme.typography.titleMedium)
-                        if(goal.pending.isNotEmpty()) Button(onClick=onLock,enabled=!busy,modifier=Modifier.testTag("lock-next")) { Text("确认下一项") }
+                        if(goal.pending.isNotEmpty() && goal.lockedGroupRoundId == null) Button(onClick=onLock,enabled=!busy,modifier=Modifier.testTag("lock-next")) { Text("确认下一项") }
+                        if(goal.lockedGroupRoundId != null) Text("本目标内需按顺序完成当前关联组，不能提前确认组外步骤。", color=MaterialTheme.colorScheme.primary)
                     }
                     if(state.active != null) Text("完成当前正在执行的任务后，才能开始下一项。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 }
@@ -307,14 +325,20 @@ private fun GoalDetail(state: AppState, goal: Goal, today: LocalDate, now: Insta
                 Column {
                     Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically) {
                         Text("待执行 · ${goal.pending.size}",Modifier.weight(1f),style=MaterialTheme.typography.titleMedium)
+                        if(goal.pending.count { !it.isGrouped } >= 2) TextButton(onClick=onGroup,enabled=!busy,modifier=Modifier.testTag("link-tasks")) { Text("关联步骤") }
                         TextButton(onClick=onAdd,enabled=!busy,modifier=Modifier.testTag("add-task")) { Text("＋ 添加步骤") }
                     }
                     Text("长按任意卡片拖动排序。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             if(goal.pending.isEmpty()) item("no-pending") { Text("待执行清单为空，新任务会按添加顺序排列。",style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant) }
-            itemsIndexed(drag.tasks,key={_,t->"task-${t.id}"}) { index, task ->
-                PendingRow(task,goal,GoalRules.canDeleteTask(state,goal,task),index,goal.pending.size,busy,drag.draggedId==task.id,drag.offset(task.id),{onMove(task.id,it)},{onEditTask(task.id)},{deleteId=task.id})
+            val seenRounds = mutableSetOf<String>()
+            val displayed = drag.tasks.filter { !it.isGrouped || seenRounds.add(it.groupRoundId!!) }
+            itemsIndexed(displayed,key={_,t->"task-${t.id}"}) { index, task ->
+                PendingRow(task,goal,GoalRules.canDeleteTask(state,goal,task),index,displayed.size,busy,drag.draggedId==task.id,drag.offset(task.id),{ targetBlock ->
+                    val targetId = displayed[targetBlock].id
+                    onMove(task.id,drag.tasks.indexOfFirst { it.id == targetId }) { drag.revert() }
+                },{onEditTask(task.id)},{deleteId=task.id},{ task.groupId?.let { onUnlink(it) }; Unit },{ task.groupId?.let { onEditGroup(it) }; Unit })
             }
         }
         item("done-heading") { TextButton(onClick={showDone=!showDone}) { Text("${if(showDone) "▾" else "▸"} 已完成 · ${goal.done.size}") } }
@@ -337,7 +361,7 @@ private fun GoalDetail(state: AppState, goal: Goal, today: LocalDate, now: Insta
 }
 
 @Composable
-private fun PendingRow(task: Task, goal: Goal, canDelete: Boolean, index: Int, count: Int, busy: Boolean, dragging: Boolean, offset: Float, onMove: (Int) -> Unit, onEdit: () -> Unit, onDelete: () -> Unit) {
+private fun PendingRow(task: Task, goal: Goal, canDelete: Boolean, index: Int, count: Int, busy: Boolean, dragging: Boolean, offset: Float, onMove: (Int) -> Unit, onEdit: () -> Unit, onDelete: () -> Unit, onUnlink: () -> Unit, onEditGroup: () -> Unit) {
     Surface(Modifier.fillMaxWidth().zIndex(if(dragging) 1f else 0f).graphicsLayer { translationY=offset }.testTag("pending-${task.id}").semantics {
         customActions=if(busy) emptyList() else buildList {
             if(index>0) add(CustomAccessibilityAction("前移一位") { onMove(index-1);true })
@@ -351,10 +375,19 @@ private fun PendingRow(task: Task, goal: Goal, canDelete: Boolean, index: Int, c
                 Icon(Icons.Outlined.DragHandle,null,Modifier.size(20.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)
             }
             TaskKind(task, goal)
+            if(task.isGrouped) {
+                val group = goal.group(task.groupId!!)
+                Text(group.members.mapIndexed { i,m -> "${i+1}. ${m.title}" }.joinToString("\n"), style=MaterialTheme.typography.bodyMedium)
+                Text(if(goal.lockedGroupRoundId == task.groupRoundId) "本目标内需按顺序完成；已完成成员仍保留在本轮记录中。" else "外层排序会移动整轮，不能把其他步骤插入组内。", style=MaterialTheme.typography.bodySmall, color=MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             if(!canDelete) Text(if(task.isQuantified) "累计达到目标后自动结束循环。" else "循环已开始，执行时可选择结束循环。", style=MaterialTheme.typography.bodySmall, color=MaterialTheme.colorScheme.onSurfaceVariant)
             Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.End) {
                 TextButton(onClick=onEdit,enabled=!busy) { Text("编辑") }
                 if(canDelete) TextButton(onClick=onDelete,enabled=!busy) { Text("删除") }
+                if(task.isGrouped && task.groupPosition == 0 && goal.lockedGroupRoundId != task.groupRoundId && goal.groupRounds.count { it.groupId == task.groupId } == 1) {
+                    TextButton(onClick=onEditGroup,enabled=!busy) { Text("编辑关联") }
+                    TextButton(onClick=onUnlink,enabled=!busy) { Text("解除关联") }
+                }
             }
         }
     }
@@ -362,9 +395,15 @@ private fun PendingRow(task: Task, goal: Goal, canDelete: Boolean, index: Int, c
 
 @Composable
 internal fun TaskKind(task: Task, goal: Goal) {
-    Text(if(task.isRecurring) "${if(task.isQuantified) "累计型循环" else "循环型"} · 已完成 ${goal.completedCount(task)} 次${if(task.seriesEnded) " · 已结束" else ""}" else "单次型",
+    val group = GoalRules.groupFor(task, goal)
+    val round = GoalRules.roundFor(task, goal)
+    Text(if(group != null && round != null) "${group.name} · 第 ${round.number} 轮 · 本轮第 ${task.groupPosition!! + 1} / ${group.members.size} 步${if(group.ended) " · 已结束" else ""}"
+        else if(task.isRecurring) "${if(task.isQuantified) "累计型循环" else "循环型"} · 已完成 ${goal.completedCount(task)} 次${if(task.seriesEnded) " · 已结束" else ""}" else "单次型",
         style=MaterialTheme.typography.labelMedium, color=MaterialTheme.colorScheme.primary,
         modifier=Modifier.testTag("task-kind-${task.id}"))
+    if(group != null) {
+        Text("已完成 ${goal.completedRounds(group.id)} 轮${if(group.mode == StepGroupMode.QUANTITY) " · 累计 ${Quantity.format(goal.groupAccumulated(group.id))} / ${group.targetAmount} ${group.unit}" else ""}", style=MaterialTheme.typography.bodySmall, color=MaterialTheme.colorScheme.onSurfaceVariant)
+    }
     if(task.isQuantified) {
         val accumulated = goal.accumulated(task)
         Text("累计 ${Quantity.format(accumulated)} / ${task.targetAmount} ${task.unit}", style=MaterialTheme.typography.bodyMedium,

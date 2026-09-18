@@ -17,10 +17,11 @@ object CsvBackup {
     private val legacyHeader = listOf("格式版本", "记录类型", "目标ID", "目标顺序", "目标名称", "开始日期", "截止日期", "已归档", "目标创建时间", "步骤ID", "步骤顺序", "步骤内容", "步骤状态", "步骤开始时间", "步骤完成时间", "导出时间", "目标总数", "步骤总数")
     private val versionTwoHeader = legacyHeader + listOf("步骤类型", "循环ID", "循环已结束")
     private val header = versionTwoHeader + listOf("累计目标数值", "累计单位", "本次完成数值")
+    private val linkedHeader = header + "关联状态JSON"
     fun stepCount(state: AppState) = state.goals.sumOf { it.pending.size + it.done.size + if(it.next != null) 1 else 0 } + if(state.active != null) 1 else 0
     private fun time(value: Long?) = value?.let { Instant.ofEpochMilli(it).toString() } ?: ""
-    private fun row(vararg cells: Pair<Int,String>): List<String> = MutableList(header.size) { "" }.apply {
-        this[0] = "3"; cells.forEach { (index,value) -> this[index] = value }
+    private fun row(size: Int, version: String, vararg cells: Pair<Int,String>): List<String> = MutableList(size) { "" }.apply {
+        this[0] = version; cells.forEach { (index,value) -> this[index] = value }
     }
     // Keep titles starting with spreadsheet operators as literal text. Escape the
     // escape prefix too, so import can recover titles exactly, including apostrophes.
@@ -31,11 +32,17 @@ object CsvBackup {
 
     fun encode(state: AppState, exportedAt: Instant = Instant.now()): ByteArray {
         GoalRules.validate(state)
-        val rows = mutableListOf(header, row(1 to "备份",15 to exportedAt.toString(),16 to state.goals.size.toString(),17 to stepCount(state).toString()))
+        val linked = state.goals.any { it.groups.isNotEmpty() || it.groupRounds.isNotEmpty() || it.lockedGroupRoundId != null }
+        val csvHeader = if(linked) linkedHeader else header
+        val version = if(linked) "4" else "3"
+        fun makeRow(vararg cells: Pair<Int,String>) = row(csvHeader.size, version, *cells)
+        val metadata = mutableListOf(1 to "备份",15 to exportedAt.toString(),16 to state.goals.size.toString(),17 to stepCount(state).toString())
+        if(linked) metadata += 24 to StateCodec.encode(state)
+        val rows = mutableListOf(csvHeader, makeRow(*metadata.toTypedArray()))
         state.goals.forEachIndexed { goalIndex,g ->
-            rows += row(1 to "目标",2 to g.id,3 to (goalIndex+1).toString(),4 to g.title,5 to g.start.toString(),6 to g.end.toString(),7 to if(g.archived) "是" else "否",8 to time(g.createdAt))
+            rows += makeRow(1 to "目标",2 to g.id,3 to (goalIndex+1).toString(),4 to g.title,5 to g.start.toString(),6 to g.end.toString(),7 to if(g.archived) "是" else "否",8 to time(g.createdAt))
             fun add(t: Task, status: String, order: Int, startedAt: Long? = t.startedAt) {
-                rows += row(1 to "步骤",2 to g.id,9 to t.id,10 to order.toString(),11 to t.title,12 to status,13 to time(startedAt),14 to time(t.completedAt),
+                rows += makeRow(1 to "步骤",2 to g.id,9 to t.id,10 to order.toString(),11 to t.title,12 to status,13 to time(startedAt),14 to time(t.completedAt),
                     18 to if(t.isRecurring) "循环型" else "单次型",19 to (t.seriesId ?: ""),20 to if(t.seriesEnded) "是" else "否",
                     21 to (t.targetAmount ?: ""),22 to (t.unit ?: ""),23 to (t.completedAmount ?: ""))
             }
@@ -55,13 +62,13 @@ object CsvBackup {
         val text = try { decoder.decode(ByteBuffer.wrap(bytes)).toString().removePrefix("\uFEFF") }
         catch (_: java.nio.charset.CharacterCodingException) { throw IllegalArgumentException("文件不是有效的 UTF-8 CSV，请选择应用导出的原始备份") }
         val rows = parse(text)
-        require(rows.size >= 2 && rows[0] in listOf(header, versionTwoHeader, legacyHeader)) { "CSV 表头或格式不符，请选择「今天」导出的备份文件" }
-        val version = when(rows[0]) { legacyHeader -> "1"; versionTwoHeader -> "2"; else -> "3" }
+        require(rows.size >= 2 && rows[0] in listOf(linkedHeader, header, versionTwoHeader, legacyHeader)) { "CSV 表头或格式不符，请选择「今天」导出的备份文件" }
+        val version = when(rows[0]) { legacyHeader -> "1"; versionTwoHeader -> "2"; header -> "3"; else -> "4" }
         val legacy = version == "1"
         val data = rows.drop(1).mapIndexed { i, cells ->
             require(cells.size == rows[0].size) { "第 ${i+2} 条记录的列数不正确" }
             require(cells[0] == version) { "不支持此 CSV 备份版本" }
-            cells.map(::unprotect) + List(header.size - cells.size) { "" }
+            cells.map(::unprotect) + List(linkedHeader.size - cells.size) { "" }
         }
         fun requireUnusedEmpty(cells: List<String>, used: Set<Int>) {
             require(cells.indices.all { it in used || cells[it].isEmpty() }) { "${cells[1]}记录中存在不属于该类型的数据" }
@@ -80,11 +87,20 @@ object CsvBackup {
         val metadata = data.filter { it[1] == "备份" }
         require(metadata.size == 1) { "备份信息缺失或重复" }
         val meta = metadata.single()
-        requireUnusedEmpty(meta,setOf(0,1,15,16,17))
+        requireUnusedEmpty(meta,if(version == "4") setOf(0,1,15,16,17,24) else setOf(0,1,15,16,17))
         val exported = instant(meta[15],"导出时间")
         val goalRows = data.filter { it[1] == "目标" }
         val taskRows = data.filter { it[1] == "步骤" }
         require(number(meta[16],"目标总数",true) == goalRows.size && number(meta[17],"步骤总数",true) == taskRows.size) { "备份记录数量不完整，文件可能被截断或修改" }
+        if(version == "4") {
+            val state = StateCodec.decode(meta[24])
+            require(state.goals.size == goalRows.size && stepCount(state) == taskRows.size) { "关联备份摘要与步骤记录数量不一致" }
+            val expected = parse(encode(state, exported).toString(Charsets.UTF_8).removePrefix("\uFEFF")).drop(1)
+                .map { it.map(::unprotect).joinToString("\u0000") }.sorted()
+            val actual = rows.drop(1).map { it.map(::unprotect).joinToString("\u0000") }.sorted()
+            require(actual == expected) { "关联备份的步骤或组关系已被修改" }
+            return CsvSnapshot(state, exported)
+        }
         fun ordered(rows: List<List<String>>, column: Int, label: String): List<List<String>> {
             val numbered = rows.map { number(it[column],"$label 顺序") to it }.sortedBy { it.first }
             require(numbered.map { it.first } == (1..rows.size).toList()) { "$label 的顺序重复或不连续" }
@@ -142,7 +158,7 @@ object CsvBackup {
         var touched = false
         var i = 0
         fun finishCell() {
-            require(cells.size < header.size) { "CSV 列数过多" }
+            require(cells.size < linkedHeader.size) { "CSV 列数过多" }
             cells += cell.toString(); cell.setLength(0); closed = false; touched = false
         }
         fun finishRow() {

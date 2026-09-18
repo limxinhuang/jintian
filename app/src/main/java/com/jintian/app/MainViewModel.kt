@@ -40,7 +40,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
-    fun edit(change: (AppState) -> AppState, onSuccess: () -> Unit = {}) {
+    fun edit(change: (AppState) -> AppState, onSuccess: () -> Unit = {}, onError: () -> Unit = {}) {
         if (_busy.value) return
         _busy.value = true
         viewModelScope.launch {
@@ -48,8 +48,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 repository.update(change)
                 onSuccess()
             } catch (e: CancellationException) { throw e } catch (e: IllegalArgumentException) {
+                onError()
                 messages.send(e.message ?: "操作未完成，请重试")
             } catch (_: Exception) {
+                onError()
                 messages.send("保存失败，修改未生效。请检查手机存储空间后重试。")
             } finally { _busy.value = false }
         }
